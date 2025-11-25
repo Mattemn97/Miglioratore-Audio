@@ -1,1 +1,6 @@
-Pillow
+pydub
+librosa
+soundfile
+tqdm
+numpy
+scipy
