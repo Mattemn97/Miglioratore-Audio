@@ -1,151 +1,158 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
 import os
-from PIL import Image, ImageFilter
+import numpy as np
+from pydub import AudioSegment, effects
+from scipy.signal import butter, lfilter
+from tqdm import tqdm
+import noisereduce as nr
 
-# --------------------------
-# FUNZIONI DI SIMULAZIONE
-# --------------------------
+# ==================================================
+# FILTRI & FUNZIONI TECNICHE
+# ==================================================
 
-def simulate_zoom(img, f_orig, f_new):
-    """
-    - f_new > f_orig → zoom (crop)
-    - f_new < f_orig → grandangolo con bordi sfocati
-    """
+# High-Pass Filter (per togliere rimbombi)
+def highpass(data, sr, cutoff=80):
+    b, a = butter(2, cutoff / (0.5 * sr), btype='high', analog=False)
+    return lfilter(b, a, data)
 
-    w, h = img.size
+# Low-Mid reduction (rimozione "scatola")
+def remove_boxiness(data, sr, freq_low=200, freq_high=400, gain_db=-3):
+    # banda di riduzione
+    b, a = butter(
+        2,
+        [freq_low / (0.5 * sr), freq_high / (0.5 * sr)],
+        btype='band'
+    )
+    filtered = lfilter(b, a, data)
+    factor = 10 ** (gain_db / 20)
+    return data + (filtered * factor)
 
-    # -----------------------------
-    # 1) ZOOM (crop)
-    # -----------------------------
-    if f_new > f_orig:
-        zoom = f_new / f_orig
-        new_w = int(w / zoom)
-        new_h = int(h / zoom)
-
-        left = (w - new_w) // 2
-        top = (h - new_h) // 2
-        right = left + new_w
-        bottom = top + new_h
-
-        return img.crop((left, top, right, bottom))
-
-    # -----------------------------
-    # 2) GRANDANGOLO (expand con blur)
-    # -----------------------------
-    elif f_new < f_orig:
-        expand = f_orig / f_new
-
-        new_w = int(w * expand)
-        new_h = int(h * expand)
-
-        # Crea sfondo sfocato: si parte dall'immagine ingrandita
-        blurred_bg = img.resize((new_w, new_h), Image.LANCZOS)
-        blurred_bg = blurred_bg.filter(ImageFilter.GaussianBlur(radius=50))
-
-        # Incolla l'immagine originale al centro
-        offset_x = (new_w - w) // 2
-        offset_y = (new_h - h) // 2
-
-        blurred_bg.paste(img, (offset_x, offset_y))
-        return blurred_bg
-
-    else:
-        return img.copy()
+# Boost intelligibilità (3–5 kHz)
+def boost_presence(data, sr, freq_low=3000, freq_high=5000, gain_db=3):
+    b, a = butter(
+        2,
+        [freq_low / (0.5 * sr), freq_high / (0.5 * sr)],
+        btype='band'
+    )
+    boosted = lfilter(b, a, data)
+    factor = 10 ** (gain_db / 20)
+    return data + (boosted * factor)
 
 
-# --------------------------
-# MENÙ GUIDATO
-# --------------------------
+# ==================================================
+# FUNZIONE PRINCIPALE DI MIGLIORAMENTO AUDIO
+# ==================================================
+def auto_migliora_audio(in_path, out_path,
+                        do_noise, do_eq, do_deesser, do_comp, do_sat, do_limit):
 
-def guided_flow_zoom():
+    audio = AudioSegment.from_file(in_path)
+    sr = audio.frame_rate
+    samples = np.array(audio.get_array_of_samples()).astype(np.float32)
+
+    # 1️⃣ Noise Reduction
+    if do_noise:
+        samples = nr.reduce_noise(y=samples, sr=sr)
+
+    # 2️⃣ EQ (High-pass + Boxiness + Presence)
+    if do_eq:
+        samples = highpass(samples, sr)
+        samples = remove_boxiness(samples, sr)
+        samples = boost_presence(samples, sr)
+
+    # 3️⃣ De-Esser (molto leggero)
+    if do_deesser:
+        # Riduce solo frequenze 5–8 kHz
+        b, a = butter(2, [5000/(sr*0.5), 8000/(sr*0.5)], btype='band')
+        ess = lfilter(b, a, samples)
+        samples -= ess * 0.4
+
+    # 4️⃣ Compressione
+    if do_comp:
+        audio = AudioSegment(
+            samples.astype(np.int16).tobytes(),
+            frame_rate=sr,
+            sample_width=audio.sample_width,
+            channels=audio.channels
+        )
+        audio = effects.compress_dynamic_range(audio)
+        samples = np.array(audio.get_array_of_samples()).astype(np.float32)
+
+    # 5️⃣ Saturazione leggera
+    if do_sat:
+        samples = samples * 1.02
+        samples = np.tanh(samples) * 32767
+
+    # 6️⃣ Limiter
+    if do_limit:
+        peak = np.max(np.abs(samples))
+        if peak > 0:
+            samples = samples * (30000 / peak)
+
+    # Riconversione finale
+    out_audio = AudioSegment(
+        samples.astype(np.int16).tobytes(),
+        frame_rate=sr,
+        sample_width=audio.sample_width,
+        channels=audio.channels
+    )
+
+    out_audio.export(out_path, format="wav")
+
+
+# ==================================================
+# INTERFACCIA UTENTE (STILE MATTEO™)
+# ==================================================
+def main():
     os.system('cls' if os.name == 'nt' else 'clear')
-    print("— Generatore immagini a diverse lunghezze focali —\n")
+    print("🎧 ===========================================")
+    print("        AUTO-MIGLIORAMENTO AUDIO PRO")
+    print("=========================================== 🎧\n")
 
-    # 1) Input immagine
-    while True:
-        img_path = input("1) Inserisci il percorso dell'immagine sorgente: ").strip()
-        if not os.path.isfile(img_path):
-            print("❌ File non trovato. Riprova.")
-            continue
-        try:
-            img = Image.open(img_path).convert("RGB")
-        except Exception:
-            print("❌ Formato immagine non valido.")
-            continue
-        break
+    print("Questo programma ottimizza automaticamente file audio,")
+    print("applicando noise reduction, EQ, compressione, de-esser e limiter.\n")
 
-    # 2) Focale originale
-    while True:
-        try:
-            focale_orig = float(input("\n2) Inserisci la focale originale (mm): ").strip())
-            break
-        except ValueError:
-            print("❌ Valore non valido, inserisci un numero.")
+    folder_src = input("📂 Cartella SORGENTE audio: ").strip('"')
+    folder_dst = input("💾 Cartella DESTINAZIONE audio migliorato: ").strip('"')
 
-    # 3) Altre focali
-    focali = []
-    print("\n3) Inserisci le altre focali da simulare (mm)")
-    print("   (separate da spazio, es: 12 18 35 70 200)")
-    while True:
-        try:
-            raw = input("   → ").strip()
-            focali = [float(x) for x in raw.split()]
-            if len(focali) == 0:
-                print("❌ Inserisci almeno una focale.")
-                continue
-            break
-        except ValueError:
-            print("❌ Formato non valido. Usa numeri separati da spazio.")
-
-    # 4) Cartella output
-    out_dir = input("\n4) Nome cartella output [default: output_zoom]: ").strip() or "output_zoom"
-    os.makedirs(out_dir, exist_ok=True)
-
-    # 5) Formato di output
-    print("\n5) Formato output:")
-    print("   jpg | png | webp | tiff")
-    while True:
-        fmt = input("   → [default: jpg]: ").strip().lower() or "jpg"
-        if fmt in ("jpg", "jpeg", "png", "webp", "tiff"):
-            break
-        print("❌ Formato non valido.")
-
-    # 6) Anteprima impostazioni
-    print("\n📋 Anteprima impostazioni:")
-    print(f" • Immagine sorgente: {img_path}")
-    print(f" • Focale originale: {focale_orig} mm")
-    print(f" • Focali da generare: {', '.join(str(int(f)) + 'mm' for f in focali)}")
-    print(f" • Formato output: {fmt}")
-    print(f" • Cartella output: {out_dir}\n")
-
-    if input("Procedere con la generazione? [S/n]: ").strip().lower() in ("n", "no"):
-        print("❌ Operazione annullata.")
+    if not os.path.exists(folder_src):
+        print("\n❌ Cartella sorgente non trovata.")
         return
 
-    # 7) Generazione immagini
-    base_name = os.path.splitext(os.path.basename(img_path))[0]
-    ext = f".{fmt}"
+    if not os.path.exists(folder_dst):
+        os.makedirs(folder_dst)
+        print("📁 Creata cartella destinazione.\n")
 
-    print("\n⏳ Generazione in corso...\n")
+    # Scelte utente
+    print("\n🔧 Quali miglioramenti applicare? [s/n]\n")
+    do_noise   = input("   ➤ Noise Reduction: ").lower() == "s"
+    do_eq      = input("   ➤ Equalizzazione (HPF + boxiness + presence): ").lower() == "s"
+    do_deesser = input("   ➤ De-Esser: ").lower() == "s"
+    do_comp    = input("   ➤ Compressore: ").lower() == "s"
+    do_sat     = input("   ➤ Saturazione leggera: ").lower() == "s"
+    do_limit   = input("   ➤ Limiter finale: ").lower() == "s"
 
-    for f_new in focali:
-        result = simulate_zoom(img, focale_orig, f_new)
+    files = [f for f in os.listdir(folder_src)
+             if f.lower().endswith(('.wav', '.mp3', '.flac', '.ogg', '.m4a'))]
 
-        kind = "WIDE" if f_new < focale_orig else "ZOOM"
-        out_name = f"{base_name}_{kind}_{int(f_new)}mm{ext}"
-        out_path = os.path.join(out_dir, out_name)
+    if not files:
+        print("\n❌ Nessun file audio trovato.")
+        return
 
-        result.save(out_path)
-        print(f"✔  Salvata {kind} {int(f_new)}mm → {out_path}")
+    print(f"\n🎵 Trovati {len(files)} file audio. Inizio elaborazione...\n")
 
-    print("\n✅ Tutto fatto! Buona visione 🎉")
+    for f in tqdm(files, ncols=100, desc="Elaborazione"):
+        in_file = os.path.join(folder_src, f)
+        name, ext = os.path.splitext(f)
+        out_file = os.path.join(folder_dst, f"{name} - edit.wav")
 
+        auto_migliora_audio(
+            in_file, out_file,
+            do_noise, do_eq, do_deesser, do_comp, do_sat, do_limit
+        )
 
-# --------------------------
-# Entrypoint
-# --------------------------
+    print("\n✅ Tutti gli audio sono stati elaborati!")
+    print(f"📁 File finali in: {folder_dst}")
+    print("\nGrazie per aver usato l’audio-miglioratore di Matteo™ 😎")
 
+# ==================================================
 if __name__ == "__main__":
-    guided_flow_zoom()
+    main()
